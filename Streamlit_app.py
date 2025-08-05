@@ -3,6 +3,7 @@ import feedparser
 import pandas as pd
 from datetime import datetime, timedelta
 import re
+import time
 import requests
 from bs4 import BeautifulSoup
 from geotext import GeoText
@@ -266,6 +267,11 @@ def fetch_and_store_feeds():
     insert_header_if_missing(sheet)
     last_run = get_last_run(sheet)
     count = 0
+
+    # Only one read to get all existing links (column 2 = 'link')
+    all_rows = sheet.get_all_values()[1:]  # skip header
+    existing_links = set(row[2] for row in all_rows if len(row) > 2)
+    
     for category, feeds in RSS_FEEDS.items():
         for feed_info in feeds:
             feed = feedparser.parse(feed_info['url'])
@@ -273,13 +279,22 @@ def fetch_and_store_feeds():
                 if count >= MAX_ARTICLES_PER_RUN:
                     set_last_run(sheet)
                     return count
+
                 title = entry.get('title', '').strip()
                 summary = clean_html(entry.get('summary', '') or entry.get('description', ''))
                 link = entry.get('link', '').strip()
+                if not title or not link:
+                    continue
 
+                # Only keep news matching keywords
                 if not article_matches_keywords(f"{title} {summary}"):
                     continue
 
+                # Avoid duplicates
+                if link in existing_links:
+                    continue
+
+                # Handle published date
                 published = None
                 if hasattr(entry, 'published_parsed') and entry.published_parsed:
                     published_dt = datetime(*entry.published_parsed[:6])
@@ -290,6 +305,7 @@ def fetch_and_store_feeds():
                 else:
                     continue
 
+                pub_date = pd.to_datetime(published, errors='coerce')
                 if pd.isnull(pub_date) or pub_date <= last_run:
                     continue
 
@@ -297,6 +313,7 @@ def fetch_and_store_feeds():
                 geography = detect_geography(full_text)
                 ai_summary = call_openai_summary(full_text)
 
+                # Insert article and update the in-memory set
                 insert_article({
                     'title': title,
                     'summary': summary,
@@ -309,7 +326,12 @@ def fetch_and_store_feeds():
                     'full_text': full_text,
                     'ai_summary': ai_summary
                 })
+                existing_links.add(link)
                 count += 1
+
+                # Optional: throttle to be nice to Google Sheets API (uncomment if needed)
+                # time.sleep(1)
+
     set_last_run(sheet)
     return count
 
@@ -388,6 +410,7 @@ else:
     st.dataframe(filtered[["published", "title", "category", "source", "summary", "ai_summary"]], use_container_width=True)
     csv = filtered.to_csv(index=False)
     st.download_button("Download as CSV", csv, "filtered_news.csv", "text/csv")
+
 
 
 
