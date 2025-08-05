@@ -262,6 +262,11 @@ def fetch_article_fallback_bs4(url):
 def article_matches_keywords(text):
     return any(re.search(rf'\b{re.escape(k.lower())}\b', text.lower()) for k in KEYWORDS)
 
+@st.cache_data
+def get_cached_links():
+    df = load_data()
+    return set(df["link"].dropna())
+
 def fetch_and_store_feeds():
     sheet = connect_to_sheet()
     insert_header_if_missing(sheet)
@@ -407,12 +412,19 @@ st.write(f"### Showing {len(filtered)} articles")
 if filtered.empty:
     st.warning("No articles match these filters.")
 else:
-    st.dataframe(filtered[["published", "title", "category", "source", "summary", "ai_summary"]], use_container_width=True)
-    csv = filtered.to_csv(index=False)
+    # Make title clickable; drop 'ai_summary'
+    display_df = filtered[["published", "title", "category", "source", "summary", "link"]].copy()
+    display_df["title"] = display_df.apply(
+        lambda row: f'<a href="{row["link"]}" target="_blank">{row["title"]}</a>', axis=1
+    )
+    display_df = display_df.drop(columns="link")
+    st.write(f"### Showing {len(filtered)} articles")
+    st.write("_(Click on article title to open the link)_")
+    st.write(
+        display_df.to_html(escape=False, index=False),
+        unsafe_allow_html=True,
+    )
+    csv = filtered[["published", "title", "category", "source", "summary", "link"]].to_csv(index=False)
     st.download_button("Download as CSV", csv, "filtered_news.csv", "text/csv")
-
-
-
-
 
 
