@@ -252,10 +252,7 @@ def detect_geography(text):
 summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
 
 def call_openai_summary(text):
-    try:
-        return summarizer(text[:1024], max_length=120, min_length=30, do_sample=False)[0]['summary_text']
-    except:
-        return ""
+        return "" # Or: "AI summary disabled."
 
 def fetch_article_fallback_bs4(url):
     try:
