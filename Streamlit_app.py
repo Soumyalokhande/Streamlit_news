@@ -10,8 +10,8 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 # ======= CONFIG =======
-DAYS_LIMIT = 10
-MAX_ARTICLES_PER_RUN = 100
+DAYS_LIMIT = 5
+MAX_ARTICLES_PER_RUN = 10000000
 
 GOOGLE_SHEET_NAME = "Agentis News Feed"
 SERVICE_ACCOUNT_FILE = "service_account.json"
@@ -62,14 +62,11 @@ RSS_FEEDS = {
     ],
 
     "Public-Private Partnerships (PPP) & Social Infrastructure": [
-        {"name": "P3 Bulletin", "url": "https://www.p3bulletin.com/rss.xml", "logo": "https://www.p3bulletin.com/favicon.ico", "source_type": "Media"},
         {"name": "InfraPPP", "url": "https://www.infrapppworld.com/rss", "logo": "https://www.infrapppworld.com/favicon.ico", "source_type": "Media"},
         {"name": "Global Infrastructure Hub", "url": "https://cdn.gihub.org/infrastructure-news/rss.xml", "logo": "https://cdn.gihub.org/favicon.ico", "source_type": "Government"},
-        {"name": "Infrastructure Magazine Australia", "url": "https://www.infrastructuremagazine.com.au/feed/", "logo": "https://www.infrastructuremagazine.com.au/favicon.ico", "source_type": "Media"},
         {"name": "Engineering News-Record", "url": "https://www.enr.com/rss/feed", "logo": "https://www.enr.com/favicon.ico", "source_type": "Media"},
         {"name": "Smart Cities Dive", "url": "https://www.smartcitiesdive.com/feeds/all/", "logo": "https://www.smartcitiesdive.com/favicon.ico", "source_type": "Media"},
         {"name": "Construction Dive", "url": "https://www.constructiondive.com/feeds/all/", "logo": "https://www.constructiondive.com/favicon.ico", "source_type": "Media"},
-        {"name": "Infrastructure Today", "url": "https://infrastructuretoday.co.in/feed/", "logo": "https://infrastructuretoday.co.in/favicon.ico", "source_type": "Media"}
     ],
 
     "Investment & Project Finance": [
@@ -392,4 +389,5 @@ else:
     st.dataframe(filtered[["published", "title", "category", "source", "summary", "ai_summary"]], use_container_width=True)
     csv = filtered.to_csv(index=False)
     st.download_button("Download as CSV", csv, "filtered_news.csv", "text/csv")
+
 
