@@ -204,6 +204,125 @@ def ensure_headers(sheet):
             sheet.delete_row(2)
         sheet.insert_row(desired_headers, index=2)
 
+def is_article_duplicate(sheet, link):
+    links = [row[2] for row in sheet.get_all_values()[1:] if len(row) > 2]
+    return link in links
+
+def insert_article(article):
+    sheet = connect_to_sheet()
+    if is_article_duplicate(sheet, article['link']):
+        return
+    row = [
+        article['title'], article['summary'], article['link'], article['published'],
+        article['category'], article['source'], article['geography'], article['source_type'],
+        article['ai_summary'], article['full_text']
+    ]
+    sheet.append_row(row, value_input_option='USER_ENTERED')
+
+def get_last_run(sheet):
+    val = sheet.cell(1,2).value if sheet.cell(1,2).value else None  # cell B1
+    try:
+        return pd.to_datetime(val)
+    except:
+        return datetime.now() - timedelta(days=DAYS_LIMIT)
+
+def set_last_run(sheet):
+    sheet.update_cell(1, 2, datetime.now().isoformat())
+
+def insert_header_if_missing(sheet):
+    first_row = sheet.row_values(2)
+    if not first_row or first_row[0].lower() != "title":
+        sheet.insert_row([
+            "title", "summary", "link", "published", "category",
+            "source", "geography", "source_type", "ai_summary", "full_text"
+        ], index=2)
+    if not sheet.cell(1,1).value or sheet.cell(1,1).value != "last_run":
+        sheet.update_cell(1, 1, "last_run")
+        sheet.update_cell(1, 2, (datetime.now() - timedelta(days=DAYS_LIMIT)).isoformat())
+
+def clean_html(raw_html):
+    return re.sub(r'<[^>]+>', '', raw_html).strip()
+
+def detect_geography(text):
+    if not text:
+        return "Unknown"
+    places = GeoText(text)
+    return places.countries[0] if places.countries else (places.cities[0] if places.cities else "Unknown")
+
+summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+
+def call_openai_summary(text):
+    try:
+        return summarizer(text[:1024], max_length=120, min_length=30, do_sample=False)[0]['summary_text']
+    except:
+        return ""
+
+def fetch_article_fallback_bs4(url):
+    try:
+        response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        tag = soup.find('div', {'class': 'article-content'}) or soup.find('article')
+        return tag.get_text(strip=True) if tag else ""
+    except:
+        return ""
+
+def article_matches_keywords(text):
+    return any(re.search(rf'\b{re.escape(k.lower())}\b', text.lower()) for k in KEYWORDS)
+
+def fetch_and_store_feeds():
+    sheet = connect_to_sheet()
+    insert_header_if_missing(sheet)
+    last_run = get_last_run(sheet)
+    count = 0
+    for category, feeds in RSS_FEEDS.items():
+        for feed_info in feeds:
+            feed = feedparser.parse(feed_info['url'])
+            for entry in feed.entries:
+                if count >= MAX_ARTICLES_PER_RUN:
+                    set_last_run(sheet)
+                    return count
+                title = entry.get('title', '').strip()
+                summary = clean_html(entry.get('summary', '') or entry.get('description', ''))
+                link = entry.get('link', '').strip()
+
+                if not article_matches_keywords(f"{title} {summary}"):
+                    continue
+
+                published = None
+                if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                    published_dt = datetime(*entry.published_parsed[:6])
+                    published = published_dt.isoformat()
+                elif hasattr(entry, 'updated_parsed') and entry.updated_parsed:
+                    published_dt = datetime(*entry.updated_parsed[:6])
+                    published = published_dt.isoformat()
+                else:
+                    continue
+
+                pub_date = pd.to_datetime(published, errors='coerce')
+                if pd.isnull(pub_date) or pub_date <= last_run:
+                    continue
+
+                full_text = fetch_article_fallback_bs4(link)
+                geography = detect_geography(full_text)
+                ai_summary = call_openai_summary(full_text)
+
+                insert_article({
+                    'title': title,
+                    'summary': summary,
+                    'link': link,
+                    'published': published,
+                    'category': category,
+                    'source': feed_info['name'],
+                    'geography': geography,
+                    'source_type': feed_info['source_type'],
+                    'full_text': full_text,
+                    'ai_summary': ai_summary
+                })
+                count += 1
+    set_last_run(sheet)
+    return count
+
 def load_data():
     sheet = connect_to_sheet()
     ensure_headers(sheet)
@@ -221,6 +340,12 @@ def load_data():
 
 st.set_page_config("Agentis News Dashboard", layout="wide")
 st.title("Agentis Filtered News Dashboard")
+
+
+if st.button("Fetch latest news", type="primary"):
+    with st.spinner("Fetching latest news and updating sheet..."):
+        added = fetch_and_store_feeds()
+        st.success(f"Fetched and stored {added} new articles.")
 
 df = load_data()
 
