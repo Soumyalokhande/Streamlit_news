@@ -6,5 +6,5 @@ beautifulsoup4
 transformers
 geotext
 gspread
-Torch
 oauth2client
+
