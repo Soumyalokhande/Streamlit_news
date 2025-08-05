@@ -291,7 +291,9 @@ def fetch_and_store_feeds():
                     continue
 
                 pub_date = pd.to_datetime(published, errors='coerce')
-                if pd.isnull(pub_date) or pub_date <= last_run:
+                if pub_date is None or pd.isnull(pub_date) or last_run is None or pd.isnull(last_run):
+                    continue
+                if pub_date <= last_run:
                     continue
 
                 full_text = fetch_article_fallback_bs4(link)
@@ -389,5 +391,6 @@ else:
     st.dataframe(filtered[["published", "title", "category", "source", "summary", "ai_summary"]], use_container_width=True)
     csv = filtered.to_csv(index=False)
     st.download_button("Download as CSV", csv, "filtered_news.csv", "text/csv")
+
 
 
