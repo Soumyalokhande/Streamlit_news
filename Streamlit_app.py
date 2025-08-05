@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 import re
 import requests
 from bs4 import BeautifulSoup
-from transformers import pipeline
 from geotext import GeoText
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -249,8 +248,6 @@ def detect_geography(text):
     places = GeoText(text)
     return places.countries[0] if places.countries else (places.cities[0] if places.cities else "Unknown")
 
-summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
-
 def call_openai_summary(text):
         return "" # Or: "AI summary disabled."
 
@@ -395,3 +392,4 @@ else:
     st.dataframe(filtered[["published", "title", "category", "source", "summary", "ai_summary"]], use_container_width=True)
     csv = filtered.to_csv(index=False)
     st.download_button("Download as CSV", csv, "filtered_news.csv", "text/csv")
+
