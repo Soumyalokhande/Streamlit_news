@@ -292,9 +292,9 @@ def connect_to_sheet(sheet_name=GOOGLE_SHEET_NAME):
 def ensure_headers(sheet):
     header_row = sheet.row_values(2)
     if header_row != SHEET_HEADERS:
-        if header_row:
-            sheet.delete_row(2)
-        sheet.insert_row(SHEET_HEADERS, index=2)
+        # Write the headers directly into row 2 without deleting/inserting rows
+        end_a1 = rowcol_to_a1(2, len(SHEET_HEADERS))  # e.g., "M2"
+        sheet.update(f"A2:{end_a1}", [SHEET_HEADERS])
 
 def insert_header_if_missing(sheet):
     ensure_headers(sheet)
@@ -579,3 +579,4 @@ else:
             n = batch_update_relevance(selected_links, "not_relevant")
             st.success(f"Updated {n} row(s) to not_relevant.")
             st.experimental_rerun()
+
