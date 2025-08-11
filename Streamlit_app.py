@@ -152,7 +152,7 @@ def ensure_headers(sheet):
     row2 = sheet.row_values(2)
     if row2 != desired:
         if row2:
-            sheet.delete_row(2)
+            sheet.delete_rows(2)
         sheet.insert_row(desired, index=2)
     # bootstrap last_run (row1)
     if not sheet.cell(1,1).value or sheet.cell(1,1).value != "last_run":
@@ -378,3 +378,4 @@ else:
 
     csv = filtered[["published","title","category","source","summary","link"]].to_csv(index=False)
     st.download_button("Download as CSV", csv, "filtered_news.csv", "text/csv")
+
