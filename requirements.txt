@@ -6,3 +6,5 @@ beautifulsoup4>=4.13.4
 geotext>=0.4.0
 gspread>=6.2.1
 oauth2client>=4.1.3
+streamlit-autorefresh
+
