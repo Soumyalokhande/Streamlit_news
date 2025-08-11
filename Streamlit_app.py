@@ -139,7 +139,7 @@ DAYS_LIMIT = 10
 MAX_ARTICLES_PER_RUN = 200_000_000                 # keep reasonable for Sheets quotas
 APPEND_SLEEP_SEC = 0.3                     # small pause between writes
 
-GOOGLE_SHEET_NAME = "Agentis News Feed"
+GOOGLE_SHEET_NAME = "Agentis News Feed 2"
 
 SHEET_HEADERS = [
     "title", "summary", "link", "published", "category",
@@ -579,5 +579,6 @@ else:
             n = batch_update_relevance(selected_links, "not_relevant")
             st.success(f"Updated {n} row(s) to not_relevant.")
             st.experimental_rerun()
+
 
 
