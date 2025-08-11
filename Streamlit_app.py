@@ -212,7 +212,7 @@ RSS_FEEDS = {
         {"name": "Bing News – Telecom Towers", "url": "https://www.bing.com/news/search?q=\"telecom+towers\"&cc=US", "source_type": "News Aggregator"},
         {"name": "Bing News – Data Centre", "url": "https://www.bing.com/news/search?q=\"data+centre\"&cc=US", "source_type": "News Aggregator"},
         {"name": "Bing News – 5G Rollout", "url": "https://www.bing.com/news/search?q=\"5g+rollout\"&cc=US", "source_type": "News Aggregator"},
-        {"name": "Bing News – Cloud Infrastructure", "url": "https://www.bing.com/news/search?q=\"cloud+infrastructure\", "source_type": "News Aggregator"},
+        {"name": "Bing News – Cloud Infrastructure", "url": "https://www.bing.com/news/search?q=\"cloud+infrastructure\"&cc=US", "source_type": "News Aggregator"},
         ],
     "Infrastructure & Energy": [
         # Google News
@@ -850,6 +850,7 @@ else:
             n = batch_update_geo_override(selected_links, "Canada")
             st.success(f"Set geo_override=Canada for {n} row(s).")
             st.experimental_rerun()
+
 
 
 
