@@ -1,5 +1,5 @@
-# Streamlit News Dashboard — placeholders + auto-refresh + improved geo normalization
-# You can paste this as Streamlit_app.py
+# Streamlit News Dashboard — auto-refresh + strong geo normalization + curation
+# Save as: Streamlit_app.py
 
 import streamlit as st
 import feedparser
@@ -13,9 +13,10 @@ from geotext import GeoText
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from gspread.utils import rowcol_to_a1
+import tldextract
 
 # ======================== PLACEHOLDERS YOU SHOULD EDIT ========================
-# Minimal sample so the app runs. Replace/expand these with your real feeds.
+# Minimal sample feeds so the app runs. Replace/expand with your real feeds.
 RSS_FEEDS = {
     "Renewable Energy": [
         {"name": "Renewables Now", "url": "https://renewablesnow.com/news.rss", "source_type": "Media"},
@@ -134,22 +135,20 @@ KEYWORDS = [
     "smart city","resilient infrastructure","sensors","AI infrastructure",
 ]
 
-# ======================== CONFIG ========================
 DAYS_LIMIT = 10
 MAX_ARTICLES_PER_RUN = 200_000_000                 # keep reasonable for Sheets quotas
 APPEND_SLEEP_SEC = 0.3                     # small pause between writes
-
-GOOGLE_SHEET_NAME = "Agentis News Feed 2"
+GOOGLE_SHEET_NAME = "Agentis News Feed"
 
 SHEET_HEADERS = [
-    "title", "summary", "link", "published", "category",
-    "source", "geography", "source_type",
-    "ai_summary", "full_text",
-    "normalized_geography", "transaction_type", "relevance"
+    "title","summary","link","published","category",
+    "source","geography","source_type",
+    "ai_summary","full_text",
+    "normalized_geography","transaction_type","relevance",
+    "geo_confidence","geo_override"   # <-- added
 ]
 
 # ======================== GEO NORMALIZATION ========================
-# States / Provinces (names & abbreviations)
 US_STATES = {
     "alabama","alaska","arizona","arkansas","california","colorado","connecticut","delaware","florida","georgia",
     "hawaii","idaho","illinois","indiana","iowa","kansas","kentucky","louisiana","maine","maryland","massachusetts",
@@ -169,8 +168,6 @@ CA_PROVINCES = {
 }
 CA_ABBR = {"AB","BC","MB","NB","NL","NS","ON","PE","QC","SK"}
 
-# A compact set of very common cities to help classify when state/province isn’t present.
-# (You can expand these lists anytime; they are purely heuristic.)
 US_COMMON_CITIES = {
     "new york","los angeles","chicago","houston","phoenix","philadelphia","san antonio","san diego","dallas","san jose",
     "austin","jacksonville","fort worth","columbus","charlotte","san francisco","indianapolis","seattle","denver",
@@ -181,76 +178,70 @@ CA_COMMON_CITIES = {
     "london","victoria","saskatoon","regina","halifax","windsor","st. john's","markham","vaughan","mississauga","brampton"
 }
 
-def _url_country_hint(url: str) -> str | None:
+CC_MAP = {
+    "us": "US", "ca": "Canada", "uk": "UK", "gb": "UK", "au": "Australia",
+    "de": "Germany", "fr": "France", "es": "Spain", "it": "Italy", "in": "India",
+}
+
+def _domain_hint(url: str) -> str | None:
     if not url:
         return None
-    u = url.lower()
-    # Very rough hints
-    if ".ca/" in u or u.endswith(".ca"):
-        return "Canada"
-    if ".us/" in u or u.endswith(".us"):
-        return "US"
-    return None
+    try:
+        ext = tldextract.extract(url)
+        cc = ext.suffix.split(".")[-1].lower() if ext.suffix else ""
+        return CC_MAP.get(cc)
+    except Exception:
+        return None
 
-def normalize_geography(raw_text: str, link: str = "") -> str:
-    """Return 'US', 'Canada', or 'Other' using multiple heuristics."""
-    if not raw_text and not link:
-        return "Unknown"
-    t = (raw_text or "").lower()
+def normalize_geography_strong(raw_text: str, link: str = "") -> tuple[str, int]:
+    """
+    Return (country_label, confidence 0-100).
+    Fuses: domain ccTLD, direct mentions, states/provinces/abbrev, common cities, GeoText, city/ST regex.
+    """
+    text = (raw_text or "").strip()
+    low = f" {text.lower()} "
+    scores: dict[str, int] = {}
 
-    # URL hints first (cheap & helpful)
-    hint = _url_country_hint(link)
-    if hint:
-        return hint
+    def bump(label, pts): scores[label] = scores.get(label, 0) + pts
 
-    # direct mentions of countries
-    for tok in [" united states", " u.s.", " u.s.a", " usa", " america "]:
-        if tok in f" {t} ":
-            return "US"
-    if " canada" in t:
-        return "Canada"
+    # 1) Domain hint
+    hint = _domain_hint(link)
+    if hint: bump(hint, 25)
 
-    # state/province names & abbreviations
-    for s in US_STATES:
-        if f" {s} " in f" {t} ":
-            return "US"
-    for ab in US_ABBR:
-        if re.search(rf"\b{ab}\b", t):
-            return "US"
-    for p in CA_PROVINCES:
-        if f" {p} " in f" {t} ":
-            return "Canada"
-    for ab in CA_ABBR:
-        if re.search(rf"\b{ab}\b", t):
-            return "Canada"
+    # 2) Direct mentions
+    if any(tok in low for tok in [" united states ", " u.s. ", " usa ", " america "]): bump("US", 40)
+    if " canada " in low: bump("Canada", 40)
 
-    # city-only cases using small curated sets
-    for c in US_COMMON_CITIES:
-        if f" {c} " in f" {t} ":
-            return "US"
-    for c in CA_COMMON_CITIES:
-        if f" {c} " in f" {t} ":
-            return "Canada"
+    # 3) State / province + abbreviations
+    if any(f" {s} " in low for s in US_STATES): bump("US", 35)
+    if re.search(rf"\b({'|'.join(US_ABBR)})\b", text): bump("US", 30)
+    if any(f" {p} " in low for p in CA_PROVINCES): bump("Canada", 35)
+    if re.search(rf"\b({'|'.join(CA_ABBR)})\b", text): bump("Canada", 30)
 
-    # Try GeoText — if it yields a country list that contains US/Canada
-    places = GeoText(raw_text or "")
-    # GeoText.countries returns country names like 'United States', 'Canada'
-    for ctry in places.countries:
-        lc = ctry.lower()
-        if "united states" in lc or "usa" in lc or "u.s." in lc:
-            return "US"
-        if "canada" in lc:
-            return "Canada"
+    # 4) Common cities
+    if any(f" {c} " in low for c in US_COMMON_CITIES): bump("US", 22)
+    if any(f" {c} " in low for c in CA_COMMON_CITIES): bump("Canada", 22)
 
-    # If it found cities but no countries, try to infer via “City, ST/Province” pattern
-    if places.cities:
-        # look for patterns like "Austin, TX" or "Toronto, ON"
-        if re.search(r"\b[A-Z][a-zA-Z.\- ]+,\s?(%s)\b" % "|".join(US_ABBR), raw_text or ""):
-            return "US"
-        if re.search(r"\b[A-Z][a-zA-Z.\- ]+,\s?(%s)\b" % "|".join(CA_ABBR), raw_text or ""):
-            return "Canada"
+    # 5) GeoText countries
+    try:
+        places = GeoText(text)
+        for ctry in places.countries:
+            lc = ctry.lower()
+            if "united states" in lc or "usa" in lc or "u.s." in lc: bump("US", 28)
+            elif "canada" in lc: bump("Canada", 28)
+    except Exception:
+        pass
 
-    return "Other"
+    # 6) City, ST patterns
+    if re.search(rf"\b[A-Z][a-zA-Z.\- ]+,\s?({'|'.join(US_ABBR)})\b", text): bump("US", 26)
+    if re.search(rf"\b[A-Z][a-zA-Z.\- ]+,\s?({'|'.join(CA_ABBR)})\b", text): bump("Canada", 26)
+
+    if not scores:
+        return ("Other", 10)
+
+    label = max(scores, key=scores.get)
+    conf = min(100, scores[label])
+    return (label, conf)
 
 # ======================== TRANSACTION TAGGING ========================
 TX_PATTERNS = {
@@ -292,8 +283,7 @@ def connect_to_sheet(sheet_name=GOOGLE_SHEET_NAME):
 def ensure_headers(sheet):
     header_row = sheet.row_values(2)
     if header_row != SHEET_HEADERS:
-        # Write the headers directly into row 2 without deleting/inserting rows
-        end_a1 = rowcol_to_a1(2, len(SHEET_HEADERS))  # e.g., "M2"
+        end_a1 = rowcol_to_a1(2, len(SHEET_HEADERS))  # e.g., "O2"
         sheet.update(f"A2:{end_a1}", [SHEET_HEADERS])
 
 def insert_header_if_missing(sheet):
@@ -343,25 +333,32 @@ def build_link_to_row_map(sheet):
             link_to_row[row[link_idx]] = i
     return link_to_row
 
-def batch_update_relevance(links, label):
+def _batch_update_single_column(links, target_col_name, value_or_callable):
+    """Generic single-cell batch updater by link."""
     if not links:
         return 0
     sheet = connect_to_sheet()
     link_to_row = build_link_to_row_map(sheet)
-    rel_col = SHEET_HEADERS.index("relevance") + 1
+    col_idx = SHEET_HEADERS.index(target_col_name) + 1
 
     requests_payload = []
     for link in links:
         r = link_to_row.get(link)
         if r:
-            a1 = rowcol_to_a1(r, rel_col)
-            requests_payload.append({"range": a1, "values": [[label]]})
+            a1 = rowcol_to_a1(r, col_idx)
+            new_val = value_or_callable(link) if callable(value_or_callable) else value_or_callable
+            requests_payload.append({"range": a1, "values": [[new_val]]})
 
     if not requests_payload:
         return 0
-
     sheet.batch_update(requests_payload)
     return len(requests_payload)
+
+def batch_update_relevance(links, label):
+    return _batch_update_single_column(links, "relevance", label)
+
+def batch_update_geo_override(links, override_label):
+    return _batch_update_single_column(links, "geo_override", override_label)
 
 def insert_article(article):
     sheet = connect_to_sheet()
@@ -371,6 +368,7 @@ def insert_article(article):
         article.get('ai_summary', ""), article.get('full_text', ""),
         article.get('normalized_geography', "Unknown"), article.get('transaction_type', "Other"),
         article.get('relevance', "unknown"),
+        article.get('geo_confidence', 0), article.get('geo_override', "")
     ]
     sheet.append_row(row, value_input_option='USER_ENTERED')
     time.sleep(APPEND_SLEEP_SEC)
@@ -401,10 +399,8 @@ def fetch_and_store_feeds():
 
                 if not title or not link:
                     continue
-
                 if not article_matches_keywords(f"{title} {summary}"):
                     continue
-
                 if link in existing_links:
                     continue
 
@@ -424,9 +420,10 @@ def fetch_and_store_feeds():
                     continue
 
                 full_text = fetch_article_fallback_bs4(link)
+                geo_text = " ".join([title, summary, full_text or ""])
                 geography = detect_geography(full_text or summary or title)
-                normalized_geo = normalize_geography(" ".join([title, summary, full_text or ""]), link=link)
-                tx_type = tag_transaction_type(" ".join([title, summary, full_text or ""]))
+                normalized_geo, geo_conf = normalize_geography_strong(geo_text, link=link)
+                tx_type = tag_transaction_type(geo_text)
 
                 insert_article({
                     'title': title,
@@ -442,6 +439,8 @@ def fetch_and_store_feeds():
                     'normalized_geography': normalized_geo,
                     'transaction_type': tx_type,
                     'relevance': "unknown",
+                    'geo_confidence': geo_conf,
+                    'geo_override': ""
                 })
                 existing_links.add(link)
                 count += 1
@@ -462,11 +461,17 @@ def load_data():
         df['published'] = pd.to_datetime(df['published'], errors='coerce')
     return df
 
+def effective_geo_col(df: pd.DataFrame) -> pd.Series:
+    # prefer manual override if set
+    override = df["geo_override"].astype(str).str.strip()
+    eff = override.where(override != "", df["normalized_geography"])
+    return eff
+
 # ======================== UI ========================
 st.set_page_config("Agentis News Dashboard", layout="wide")
 st.title("Agentis Filtered News Dashboard")
 
-# Auto-refresh every 15 minutes (adjust as you like)
+# Auto-refresh every 15 minutes (optional)
 try:
     from streamlit_autorefresh import st_autorefresh
     st_autorefresh(interval=15 * 60 * 1000, key="auto_refresh_15min")
@@ -480,8 +485,8 @@ with top_col1:
             try:
                 added = fetch_and_store_feeds()
                 st.success(f"Fetched and stored {added} new articles.")
-            except gspread.exceptions.APIError:
-                st.error("Google Sheets API error. Try again later.")
+            except gspread.exceptions.APIError as e:
+                st.error(f"Google Sheets API error. Try again later. ({e})")
             except Exception as e:
                 st.error(f"Error during fetch: {e}")
 
@@ -501,18 +506,21 @@ with st.sidebar:
     category_filter = st.selectbox("Category", [""] + sorted(df["category"].dropna().unique().tolist()))
     source_filter   = st.selectbox("Source",   [""] + sorted(df["source"].dropna().unique().tolist()))
     geography_filter_raw = st.selectbox("Raw Geography (optional)", [""] + sorted(df["geography"].dropna().unique().tolist()))
-    only_us_canada = st.checkbox("Show only US/Canada (normalized)", value=True)
+    only_us_canada = st.checkbox("Show only US/Canada (effective geo)", value=True)
     tx_filter = st.multiselect(
         "Transaction types",
         ["M&A", "Financial Close", "Pre-launch", "Launch", "Other"],
         default=["M&A", "Financial Close", "Pre-launch", "Launch"]
     )
     relevance_only = st.checkbox("Only relevant", value=False)
+    low_conf_only = st.checkbox("Low geo confidence (<=40)", value=False)
     date_from = st.date_input("Published From", value=None)
     date_to   = st.date_input("Published To",   value=None)
     search = st.text_input("Search (title/summary/source/category/type)")
 
 filtered = df.copy()
+eff_geo = effective_geo_col(filtered)
+filtered = filtered.assign(effective_geo=eff_geo)
 
 if category_filter:
     filtered = filtered[filtered["category"] == category_filter]
@@ -521,11 +529,15 @@ if source_filter:
 if geography_filter_raw:
     filtered = filtered[filtered["geography"] == geography_filter_raw]
 if only_us_canada:
-    filtered = filtered[filtered["normalized_geography"].isin(["US", "Canada"])]
+    filtered = filtered[filtered["effective_geo"].isin(["US", "Canada"])]
 if tx_filter:
     filtered = filtered[filtered["transaction_type"].isin(tx_filter)]
 if relevance_only:
     filtered = filtered[filtered["relevance"].str.lower() == "relevant"]
+if low_conf_only:
+    # geo_confidence may be empty string; coerce to numeric safely
+    gc = pd.to_numeric(filtered["geo_confidence"], errors="coerce").fillna(0)
+    filtered = filtered[gc <= 40]
 if date_from:
     filtered = filtered[filtered["published"] >= pd.to_datetime(date_from)]
 if date_to:
@@ -533,7 +545,7 @@ if date_to:
 if search:
     tokens = search.lower().split()
     def rowtext(r):
-        return f"{r['title']} {r['summary']} {r['source']} {r['category']} {r['transaction_type']} {r['normalized_geography']}".lower()
+        return f"{r['title']} {r['summary']} {r['source']} {r['category']} {r['transaction_type']} {r['effective_geo']}".lower()
     filtered = filtered[filtered.apply(lambda r: all(t in rowtext(r) for t in tokens), axis=1)]
 
 filtered = filtered.sort_values(by="published", ascending=False)
@@ -542,23 +554,30 @@ st.subheader(f"Results ({len(filtered)})")
 if filtered.empty:
     st.warning("No articles match these filters.")
 else:
-    # Clickable titles (hide raw link)
-    display_df = filtered[["published", "title", "category", "source", "summary", "link",
-                           "transaction_type", "normalized_geography", "relevance"]].copy()
+    # Clickable titles (hide raw link), include geo/conf
+    display_df = filtered[[
+        "published","title","category","source","summary","link",
+        "transaction_type","effective_geo","geo_confidence","relevance"
+    ]].copy()
     display_df["title"] = display_df.apply(lambda row: f'<a href="{row["link"]}" target="_blank">{row["title"]}</a>', axis=1)
     display_df = display_df.drop(columns="link")
     st.write("_(Click the title to open the article)_")
     st.write(display_df.to_html(escape=False, index=False), unsafe_allow_html=True)
 
-    csv = filtered[["published", "title", "category", "source", "summary", "link",
-                    "transaction_type", "normalized_geography", "relevance"]].to_csv(index=False)
+    csv = filtered[[
+        "published","title","category","source","summary","link",
+        "transaction_type","effective_geo","geo_confidence","relevance"
+    ]].to_csv(index=False)
     st.download_button("Download as CSV", csv, "filtered_news.csv", "text/csv")
 
-    # Curation
+    # -------- Curation --------
     st.markdown("---")
-    st.subheader("Curate relevance")
-    table_for_edit = filtered[["published","title","category","source","summary","link",
-                               "transaction_type","normalized_geography","relevance"]].copy()
+    st.subheader("Curate relevance & geo override")
+
+    table_for_edit = filtered[[
+        "published","title","category","source","summary","link",
+        "transaction_type","effective_geo","geo_confidence","relevance"
+    ]].copy()
     table_for_edit.insert(0, "select", False)
     edited = st.data_editor(
         table_for_edit,
@@ -568,17 +587,24 @@ else:
     )
     selected_links = edited[edited["select"]]["link"].tolist()
 
-    c1, c2, _ = st.columns([1,1,4])
+    c1, c2, c3, c4, c5 = st.columns([1,1,1,1,4])
     with c1:
-        if st.button("Mark as Relevant ✅", disabled=len(selected_links)==0, use_container_width=True):
+        if st.button("Relevant ✅", disabled=len(selected_links)==0, use_container_width=True):
             n = batch_update_relevance(selected_links, "relevant")
             st.success(f"Updated {n} row(s) to relevant.")
             st.experimental_rerun()
     with c2:
-        if st.button("Mark as Not Relevant 🚫", disabled=len(selected_links)==0, use_container_width=True):
+        if st.button("Not Relevant 🚫", disabled=len(selected_links)==0, use_container_width=True):
             n = batch_update_relevance(selected_links, "not_relevant")
             st.success(f"Updated {n} row(s) to not_relevant.")
             st.experimental_rerun()
-
-
-
+    with c3:
+        if st.button("Set Geo: US", disabled=len(selected_links)==0, use_container_width=True):
+            n = batch_update_geo_override(selected_links, "US")
+            st.success(f"Set geo_override=US for {n} row(s).")
+            st.experimental_rerun()
+    with c4:
+        if st.button("Set Geo: Canada", disabled=len(selected_links)==0, use_container_width=True):
+            n = batch_update_geo_override(selected_links, "Canada")
+            st.success(f"Set geo_override=Canada for {n} row(s).")
+            st.experimental_rerun()
