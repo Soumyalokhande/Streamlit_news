@@ -109,11 +109,6 @@ RSS_FEEDS = {
         {"name": "Reuters Business News", "url": "http://feeds.reuters.com/reuters/businessNews", "source_type": "Finance"},
         {"name": "Bloomberg Markets", "url": "https://www.bloomberg.com/feed/podcast/etf-report.xml", "source_type": "Finance"},
     ],
-    "Technology": [
-        {"name": "TechCrunch", "url": "http://feeds.feedburner.com/TechCrunch/","source_type": "Technology"},
-        {"name": "The Verge", "url": "https://www.theverge.com/rss/index.xml","source_type": "Technology"},
-        {"name": "Wired", "url": "https://www.wired.com/feed/rss","source_type": "Technology"},
-    ],
     "General": [
         {"name": "CNN Top Stories", "url": "http://rss.cnn.com/rss/edition.rss", "source_type": "General"},
         {"name": "BBC World News", "url": "http://feeds.bbci.co.uk/news/world/rss.xml", "source_type": "General"},
@@ -849,6 +844,7 @@ else:
             n = batch_update_geo_override(selected_links, "Canada")
             st.success(f"Set geo_override=Canada for {n} row(s).")
             st.experimental_rerun()
+
 
 
 
