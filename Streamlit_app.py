@@ -1,4 +1,6 @@
-# Streamlit_app.py
+# Streamlit News Dashboard — placeholders + auto-refresh + improved geo normalization
+# You can paste this as Streamlit_app.py
+
 import streamlit as st
 import feedparser
 import pandas as pd
@@ -10,14 +12,10 @@ from bs4 import BeautifulSoup
 from geotext import GeoText
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from gspread.utils import rowcol_to_a1
 
-# =========================
-# CONFIG
-# =========================
-DAYS_LIMIT = 10
-MAX_ARTICLES_PER_RUN = 1_000_000  # effectively unlimited for manual runs
-GOOGLE_SHEET_NAME = "Agentis News Feed"
-
+# ======================== PLACEHOLDERS YOU SHOULD EDIT ========================
+# Minimal sample so the app runs. Replace/expand these with your real feeds.
 RSS_FEEDS = {
     "Renewable Energy": [
         {"name": "Renewables Now", "url": "https://renewablesnow.com/news.rss", "source_type": "Media"},
@@ -136,245 +134,448 @@ KEYWORDS = [
     "smart city","resilient infrastructure","sensors","AI infrastructure",
 ]
 
-# =========================
-# GOOGLE SHEETS HELPERS
-# =========================
+# ======================== CONFIG ========================
+DAYS_LIMIT = 5
+MAX_ARTICLES_PER_RUN = 200                 # keep reasonable for Sheets quotas
+APPEND_SLEEP_SEC = 0.3                     # small pause between writes
+
+GOOGLE_SHEET_NAME = "Agentis News Feed"
+
+SHEET_HEADERS = [
+    "title", "summary", "link", "published", "category",
+    "source", "geography", "source_type",
+    "ai_summary", "full_text",
+    "normalized_geography", "transaction_type", "relevance"
+]
+
+# ======================== GEO NORMALIZATION ========================
+# States / Provinces (names & abbreviations)
+US_STATES = {
+    "alabama","alaska","arizona","arkansas","california","colorado","connecticut","delaware","florida","georgia",
+    "hawaii","idaho","illinois","indiana","iowa","kansas","kentucky","louisiana","maine","maryland","massachusetts",
+    "michigan","minnesota","mississippi","missouri","montana","nebraska","nevada","new hampshire","new jersey",
+    "new mexico","new york","north carolina","north dakota","ohio","oklahoma","oregon","pennsylvania","rhode island",
+    "south carolina","south dakota","tennessee","texas","utah","vermont","virginia","washington","west virginia",
+    "wisconsin","wyoming"
+}
+US_ABBR = {
+    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA","ME","MD","MA","MI",
+    "MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT",
+    "VT","VA","WA","WV","WI","WY"
+}
+CA_PROVINCES = {
+    "alberta","british columbia","manitoba","new brunswick","newfoundland and labrador",
+    "nova scotia","ontario","prince edward island","quebec","saskatchewan"
+}
+CA_ABBR = {"AB","BC","MB","NB","NL","NS","ON","PE","QC","SK"}
+
+# A compact set of very common cities to help classify when state/province isn’t present.
+# (You can expand these lists anytime; they are purely heuristic.)
+US_COMMON_CITIES = {
+    "new york","los angeles","chicago","houston","phoenix","philadelphia","san antonio","san diego","dallas","san jose",
+    "austin","jacksonville","fort worth","columbus","charlotte","san francisco","indianapolis","seattle","denver",
+    "washington","boston","nashville","el paso","detroit","memphis","portland"
+}
+CA_COMMON_CITIES = {
+    "toronto","montreal","vancouver","calgary","edmonton","ottawa","winnipeg","quebec city","hamilton","kitchener",
+    "london","victoria","saskatoon","regina","halifax","windsor","st. john's","markham","vaughan","mississauga","brampton"
+}
+
+def _url_country_hint(url: str) -> str | None:
+    if not url:
+        return None
+    u = url.lower()
+    # Very rough hints
+    if ".ca/" in u or u.endswith(".ca"):
+        return "Canada"
+    if ".us/" in u or u.endswith(".us"):
+        return "US"
+    return None
+
+def normalize_geography(raw_text: str, link: str = "") -> str:
+    """Return 'US', 'Canada', or 'Other' using multiple heuristics."""
+    if not raw_text and not link:
+        return "Unknown"
+    t = (raw_text or "").lower()
+
+    # URL hints first (cheap & helpful)
+    hint = _url_country_hint(link)
+    if hint:
+        return hint
+
+    # direct mentions of countries
+    for tok in [" united states", " u.s.", " u.s.a", " usa", " america "]:
+        if tok in f" {t} ":
+            return "US"
+    if " canada" in t:
+        return "Canada"
+
+    # state/province names & abbreviations
+    for s in US_STATES:
+        if f" {s} " in f" {t} ":
+            return "US"
+    for ab in US_ABBR:
+        if re.search(rf"\b{ab}\b", t):
+            return "US"
+    for p in CA_PROVINCES:
+        if f" {p} " in f" {t} ":
+            return "Canada"
+    for ab in CA_ABBR:
+        if re.search(rf"\b{ab}\b", t):
+            return "Canada"
+
+    # city-only cases using small curated sets
+    for c in US_COMMON_CITIES:
+        if f" {c} " in f" {t} ":
+            return "US"
+    for c in CA_COMMON_CITIES:
+        if f" {c} " in f" {t} ":
+            return "Canada"
+
+    # Try GeoText — if it yields a country list that contains US/Canada
+    places = GeoText(raw_text or "")
+    # GeoText.countries returns country names like 'United States', 'Canada'
+    for ctry in places.countries:
+        lc = ctry.lower()
+        if "united states" in lc or "usa" in lc or "u.s." in lc:
+            return "US"
+        if "canada" in lc:
+            return "Canada"
+
+    # If it found cities but no countries, try to infer via “City, ST/Province” pattern
+    if places.cities:
+        # look for patterns like "Austin, TX" or "Toronto, ON"
+        if re.search(r"\b[A-Z][a-zA-Z.\- ]+,\s?(%s)\b" % "|".join(US_ABBR), raw_text or ""):
+            return "US"
+        if re.search(r"\b[A-Z][a-zA-Z.\- ]+,\s?(%s)\b" % "|".join(CA_ABBR), raw_text or ""):
+            return "Canada"
+
+    return "Other"
+
+# ======================== TRANSACTION TAGGING ========================
+TX_PATTERNS = {
+    "M&A": [
+        r"\bacquires?\b", r"\bacquisition\b", r"\bmerger\b", r"\bmerges?\b",
+        r"\btakeover\b", r"\bbuyout\b", r"\bsale of\b", r"\bsells?\b", r"\bdivest(s|iture|ment)\b"
+    ],
+    "Financial Close": [
+        r"\bfinancial close\b", r"\breaches? financial close\b", r"\bfunded\b", r"\bdebt financing\b",
+        r"\bproject finance\b", r"\bnon-recourse\b", r"\bterm loan\b"
+    ],
+    "Launch": [
+        r"\blaunch(es|ed)?\b", r"\bopens?\b", r"\bgos? live\b"
+    ],
+    "Pre-launch": [
+        r"\bpre[- ]?launch\b", r"\bpreliminary\b", r"\bterm sheet\b", r"\bmandate(d)?\b", r"\bRFP\b", r"\bmarket sounding\b"
+    ],
+}
+
+def tag_transaction_type(text: str) -> str:
+    if not text:
+        return "Other"
+    t = text.lower()
+    for label, pats in TX_PATTERNS.items():
+        for p in pats:
+            if re.search(p, t):
+                return label
+    return "Other"
+
+# ======================== SHEETS HELPERS ========================
 @st.cache_resource
-def connect_to_sheet(sheet_name: str = GOOGLE_SHEET_NAME):
-    credentials_dict = st.secrets["gcp_service_account"]
+def connect_to_sheet(sheet_name=GOOGLE_SHEET_NAME):
+    credentials_dict = dict(st.secrets["gcp_service_account"])  # put JSON dict in secrets
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(dict(credentials_dict), scope)
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(credentials_dict, scope)
     client = gspread.authorize(creds)
     return client.open(sheet_name).sheet1
 
 def ensure_headers(sheet):
-    desired = ["title","summary","link","published","category","source","geography","source_type","ai_summary","full_text"]
-    row2 = sheet.row_values(2)
-    if row2 != desired:
-        if row2:
+    header_row = sheet.row_values(2)
+    if header_row != SHEET_HEADERS:
+        if header_row:
             sheet.delete_row(2)
-        sheet.insert_row(desired, index=2)
-    # bootstrap last_run (row1)
-    if not sheet.cell(1,1).value or sheet.cell(1,1).value != "last_run":
-        sheet.update_cell(1,1,"last_run")
-        sheet.update_cell(1,2,(datetime.now() - timedelta(days=DAYS_LIMIT)).isoformat())
+        sheet.insert_row(SHEET_HEADERS, index=2)
 
-def get_last_run(sheet) -> datetime:
-    val = sheet.cell(1,2).value
+def insert_header_if_missing(sheet):
+    ensure_headers(sheet)
+    if not sheet.cell(1,1).value or sheet.cell(1,1).value != "last_run":
+        sheet.update_cell(1, 1, "last_run")
+        sheet.update_cell(1, 2, (datetime.now() - timedelta(days=DAYS_LIMIT)).isoformat())
+
+def get_last_run(sheet):
     try:
-        return pd.to_datetime(val)
+        val = sheet.cell(1,2).value
+        return pd.to_datetime(val) if val else (datetime.now() - timedelta(days=DAYS_LIMIT))
     except Exception:
         return datetime.now() - timedelta(days=DAYS_LIMIT)
 
 def set_last_run(sheet):
-    sheet.update_cell(1,2, datetime.now().isoformat())
+    sheet.update_cell(1, 2, datetime.now().isoformat())
 
-# =========================
-# FETCHING HELPERS
-# =========================
-def clean_html(raw_html:str) -> str:
-    return re.sub(r"<[^>]+>", "", raw_html or "").strip()
+def clean_html(raw_html):
+    return re.sub(r'<[^>]+>', '', raw_html or "").strip()
 
-def detect_geography(text:str) -> str:
+def detect_geography(text):
     if not text:
         return "Unknown"
     places = GeoText(text)
     return places.countries[0] if places.countries else (places.cities[0] if places.cities else "Unknown")
 
-def fetch_article_fallback_bs4(url:str) -> str:
+def fetch_article_fallback_bs4(url):
     try:
-        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
+        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        tag = soup.find("div", {"class": "article-content"}) or soup.find("article")
+        soup = BeautifulSoup(r.text, 'html.parser')
+        tag = soup.find('div', {'class': 'article-content'}) or soup.find('article')
         return tag.get_text(strip=True) if tag else ""
     except Exception:
         return ""
 
-def article_matches_keywords(text:str) -> bool:
-    text_l = (text or "").lower()
-    return any(re.search(rf"\b{re.escape(k.lower())}\b", text_l) for k in KEYWORDS)
+def article_matches_keywords(text):
+    return any(re.search(rf'\b{re.escape(k.lower())}\b', (text or "").lower()) for k in KEYWORDS)
 
-@st.cache_data(ttl=300)
-def get_cached_links():
-    """Prefer a narrow range read of the link column to reduce quota usage."""
+def build_link_to_row_map(sheet):
+    values = sheet.get_all_values()
+    link_idx = SHEET_HEADERS.index("link")
+    link_to_row = {}
+    for i, row in enumerate(values[2:], start=3):  # data starts at row 3
+        if len(row) > link_idx and row[link_idx]:
+            link_to_row[row[link_idx]] = i
+    return link_to_row
+
+def batch_update_relevance(links, label):
+    if not links:
+        return 0
     sheet = connect_to_sheet()
-    try:
-        vals = sheet.get_values("C3:C")
-        return set(v[0] for v in vals if v)
-    except Exception:
-        # Fallback to broader read if needed
-        all_rows = sheet.get_all_values()[1:]
-        return set(r[2] for r in all_rows if len(r) > 2)
+    link_to_row = build_link_to_row_map(sheet)
+    rel_col = SHEET_HEADERS.index("relevance") + 1
 
+    requests_payload = []
+    for link in links:
+        r = link_to_row.get(link)
+        if r:
+            a1 = rowcol_to_a1(r, rel_col)
+            requests_payload.append({"range": a1, "values": [[label]]})
+
+    if not requests_payload:
+        return 0
+
+    sheet.batch_update(requests_payload)
+    return len(requests_payload)
+
+def insert_article(article):
+    sheet = connect_to_sheet()
+    row = [
+        article.get('title', ""), article.get('summary', ""), article.get('link', ""), article.get('published', ""),
+        article.get('category', ""), article.get('source', ""), article.get('geography', ""), article.get('source_type', ""),
+        article.get('ai_summary', ""), article.get('full_text', ""),
+        article.get('normalized_geography', "Unknown"), article.get('transaction_type', "Other"),
+        article.get('relevance', "unknown"),
+    ]
+    sheet.append_row(row, value_input_option='USER_ENTERED')
+    time.sleep(APPEND_SLEEP_SEC)
+
+# ======================== FETCHER ========================
 def fetch_and_store_feeds():
     sheet = connect_to_sheet()
-    ensure_headers(sheet)
+    insert_header_if_missing(sheet)
     last_run = get_last_run(sheet)
-
-    try:
-        existing_links = get_cached_links()
-    except Exception:
-        all_rows = sheet.get_all_values()[1:]
-        existing_links = set(r[2] for r in all_rows if len(r) > 2)
-
-    rows_to_append = []
     count = 0
-    BATCH_SIZE = 50
-    RATE_LIMIT_SECONDS = 0.5
 
-    def flush_rows():
-        nonlocal rows_to_append
-        if not rows_to_append:
-            return
-        delay = 1.0
-        for _ in range(5):
-            try:
-                sheet.append_rows(rows_to_append, value_input_option="USER_ENTERED")
-                rows_to_append = []
-                get_cached_links.clear()  # invalidate cache after write
-                return
-            except gspread.exceptions.APIError as e:
-                es = str(e)
-                if "429" in es or "Quota exceeded" in es:
-                    time.sleep(delay)
-                    delay = min(delay * 2, 10)
-                else:
-                    raise
+    # Single read to load existing links
+    all_rows = sheet.get_all_values()[1:]  # skip row1 meta
+    link_idx = SHEET_HEADERS.index("link")
+    existing_links = set(row[link_idx] for row in all_rows if len(row) > link_idx and row[link_idx])
 
     for category, feeds in RSS_FEEDS.items():
         for feed_info in feeds:
-            feed = feedparser.parse(feed_info["url"])
-            for entry in feed.entries:
+            feed = feedparser.parse(feed_info['url'])
+            for entry in getattr(feed, "entries", []):
                 if count >= MAX_ARTICLES_PER_RUN:
-                    flush_rows()
+                    set_last_run(sheet)
                     return count
 
-                title = (entry.get("title") or "").strip()
-                summary = clean_html(entry.get("summary", "") or entry.get("description", "") or "")
-                link = (entry.get("link") or "").strip()
-                if not title or not link:
-                    continue
+                title = (entry.get('title') or "").strip()
+                link  = (entry.get('link')  or "").strip()
+                summary = clean_html(entry.get('summary') or entry.get('description') or "")
 
-                if link in existing_links:
+                if not title or not link:
                     continue
 
                 if not article_matches_keywords(f"{title} {summary}"):
                     continue
 
+                if link in existing_links:
+                    continue
+
+                # published logic
                 published = None
-                if getattr(entry, "published_parsed", None):
-                    published = datetime(*entry.published_parsed[:6]).isoformat()
-                elif getattr(entry, "updated_parsed", None):
-                    published = datetime(*entry.updated_parsed[:6]).isoformat()
+                if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                    dt = datetime(*entry.published_parsed[:6])
+                    published = dt.isoformat()
+                elif hasattr(entry, 'updated_parsed') and entry.updated_parsed:
+                    dt = datetime(*entry.updated_parsed[:6])
+                    published = dt.isoformat()
                 else:
                     continue
 
-                pub_date = pd.to_datetime(published, errors="coerce")
-                if pd.isna(pub_date) or pub_date <= last_run:
+                pub_date = pd.to_datetime(published, errors='coerce')
+                if pd.isnull(pub_date) or pub_date <= last_run:
                     continue
 
                 full_text = fetch_article_fallback_bs4(link)
-                geography = detect_geography(full_text)
+                geography = detect_geography(full_text or summary or title)
+                normalized_geo = normalize_geography(" ".join([title, summary, full_text or ""]), link=link)
+                tx_type = tag_transaction_type(" ".join([title, summary, full_text or ""]))
 
-                rows_to_append.append([
-                    title, summary, link, published,
-                    category, feed_info["name"], geography, feed_info["source_type"],
-                    "", full_text  # keep schema (ai_summary empty)
-                ])
+                insert_article({
+                    'title': title,
+                    'summary': summary,
+                    'link': link,
+                    'published': published,
+                    'category': category,
+                    'source': feed_info.get('name', ''),
+                    'geography': geography,
+                    'source_type': feed_info.get('source_type', ''),
+                    'full_text': full_text,
+                    'ai_summary': "",
+                    'normalized_geography': normalized_geo,
+                    'transaction_type': tx_type,
+                    'relevance': "unknown",
+                })
                 existing_links.add(link)
                 count += 1
 
-                if len(rows_to_append) >= BATCH_SIZE:
-                    flush_rows()
-
-                time.sleep(RATE_LIMIT_SECONDS)
-            time.sleep(0.5)  # brief pause between feeds
-
-    flush_rows()
-    set_last_run(sheet)  # only advance when full pass completes
+    set_last_run(sheet)
     return count
 
+# ======================== DATA LOAD ========================
 def load_data():
     sheet = connect_to_sheet()
     ensure_headers(sheet)
-    headers = ["title","summary","link","published","category","source","geography","source_type","ai_summary","full_text"]
-    data = sheet.get_all_records(expected_headers=headers, head=2)
+    data = sheet.get_all_records(expected_headers=SHEET_HEADERS, head=2)
     df = pd.DataFrame(data)
+    for col in SHEET_HEADERS:
+        if col not in df.columns:
+            df[col] = ""
     if not df.empty:
-        df["published"] = pd.to_datetime(df["published"], errors="coerce")
+        df['published'] = pd.to_datetime(df['published'], errors='coerce')
     return df
 
-# =========================
-# UI
-# =========================
+# ======================== UI ========================
 st.set_page_config("Agentis News Dashboard", layout="wide")
 st.title("Agentis Filtered News Dashboard")
 
-# Optional self-refresh while open (requires extra dependency)
-# from streamlit_autorefresh import st_autorefresh
-# st_autorefresh(interval=5*60*1000, limit=10000, key="auto")  # every 5 min
+# Auto-refresh every 15 minutes (adjust as you like)
+try:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=15 * 60 * 1000, key="auto_refresh_15min")
+except Exception:
+    st.info("Tip: install `streamlit-autorefresh` to enable background refresh.")
 
-colA, colB = st.columns([1,1])
-with colA:
-    if st.button("Fetch latest news", type="primary"):
-        with st.spinner("Fetching latest news and updating sheet..."):
-            added = fetch_and_store_feeds()
-            st.success(f"Fetched and stored {added} new articles.")
-with colB:
-    st.caption("Tip: keep this open and click the button periodically. For auto-refresh, install `streamlit-autorefresh` and uncomment the code.")
+top_col1, top_col2 = st.columns([1,2])
+with top_col1:
+    if st.button("Fetch latest news", type="primary", use_container_width=True):
+        with st.spinner("Fetching latest news and updating sheet…"):
+            try:
+                added = fetch_and_store_feeds()
+                st.success(f"Fetched and stored {added} new articles.")
+            except gspread.exceptions.APIError:
+                st.error("Google Sheets API error. Try again later.")
+            except Exception as e:
+                st.error(f"Error during fetch: {e}")
 
 df = load_data()
-st.caption(f"Last data update: {df['published'].max().date() if not df.empty else 'No data loaded yet.'}")
+
+with top_col2:
+    last_dt = df['published'].max() if not df.empty else None
+    st.caption(f"Last data update: {last_dt.date() if pd.notnull(last_dt) else 'No data loaded yet.'}")
 
 if df.empty:
     st.info("No news articles yet.")
     st.stop()
 
-# Filters
+# -------- Filters --------
 with st.sidebar:
     st.markdown("## Filters")
     category_filter = st.selectbox("Category", [""] + sorted(df["category"].dropna().unique().tolist()))
-    geography_filter = st.selectbox("Geography", [""] + sorted(df["geography"].dropna().unique().tolist()))
-    source_type_filter = st.selectbox("Source Type", [""] + sorted(df["source_type"].dropna().unique().tolist()))
-    source_filter = st.selectbox("Source", [""] + sorted(df["source"].dropna().unique().tolist()))
+    source_filter   = st.selectbox("Source",   [""] + sorted(df["source"].dropna().unique().tolist()))
+    geography_filter_raw = st.selectbox("Raw Geography (optional)", [""] + sorted(df["geography"].dropna().unique().tolist()))
+    only_us_canada = st.checkbox("Show only US/Canada (normalized)", value=True)
+    tx_filter = st.multiselect(
+        "Transaction types",
+        ["M&A", "Financial Close", "Pre-launch", "Launch", "Other"],
+        default=["M&A", "Financial Close", "Pre-launch", "Launch"]
+    )
+    relevance_only = st.checkbox("Only relevant", value=False)
     date_from = st.date_input("Published From", value=None)
-    date_to = st.date_input("Published To", value=None)
-    search = st.text_input("Search (title, summary, etc)")
+    date_to   = st.date_input("Published To",   value=None)
+    search = st.text_input("Search (title/summary/source/category/type)")
 
 filtered = df.copy()
+
 if category_filter:
     filtered = filtered[filtered["category"] == category_filter]
-if geography_filter:
-    filtered = filtered[filtered["geography"] == geography_filter]
-if source_type_filter:
-    filtered = filtered[filtered["source_type"] == source_type_filter]
 if source_filter:
     filtered = filtered[filtered["source"] == source_filter]
+if geography_filter_raw:
+    filtered = filtered[filtered["geography"] == geography_filter_raw]
+if only_us_canada:
+    filtered = filtered[filtered["normalized_geography"].isin(["US", "Canada"])]
+if tx_filter:
+    filtered = filtered[filtered["transaction_type"].isin(tx_filter)]
+if relevance_only:
+    filtered = filtered[filtered["relevance"].str.lower() == "relevant"]
 if date_from:
     filtered = filtered[filtered["published"] >= pd.to_datetime(date_from)]
 if date_to:
     filtered = filtered[filtered["published"] <= pd.to_datetime(date_to)]
 if search:
     tokens = search.lower().split()
-    filtered = filtered[filtered.apply(
-        lambda r: all(t in f"{r['title']} {r['summary']} {r['source']} {r['category']} {r['source_type']}".lower() for t in tokens),
-        axis=1
-    )]
+    def rowtext(r):
+        return f"{r['title']} {r['summary']} {r['source']} {r['category']} {r['transaction_type']} {r['normalized_geography']}".lower()
+    filtered = filtered[filtered.apply(lambda r: all(t in rowtext(r) for t in tokens), axis=1)]
 
 filtered = filtered.sort_values(by="published", ascending=False)
 
-st.write(f"### Showing {len(filtered)} articles")
-
+st.subheader(f"Results ({len(filtered)})")
 if filtered.empty:
     st.warning("No articles match these filters.")
 else:
-    # clickable titles, no ai_summary in table
-    display_df = filtered[["published","title","category","source","summary","link"]].copy()
+    # Clickable titles (hide raw link)
+    display_df = filtered[["published", "title", "category", "source", "summary", "link",
+                           "transaction_type", "normalized_geography", "relevance"]].copy()
     display_df["title"] = display_df.apply(lambda row: f'<a href="{row["link"]}" target="_blank">{row["title"]}</a>', axis=1)
     display_df = display_df.drop(columns="link")
-    st.write("_(Click on an article title to open the link)_")
+    st.write("_(Click the title to open the article)_")
     st.write(display_df.to_html(escape=False, index=False), unsafe_allow_html=True)
 
-    csv = filtered[["published","title","category","source","summary","link"]].to_csv(index=False)
+    csv = filtered[["published", "title", "category", "source", "summary", "link",
+                    "transaction_type", "normalized_geography", "relevance"]].to_csv(index=False)
     st.download_button("Download as CSV", csv, "filtered_news.csv", "text/csv")
+
+    # Curation
+    st.markdown("---")
+    st.subheader("Curate relevance")
+    table_for_edit = filtered[["published","title","category","source","summary","link",
+                               "transaction_type","normalized_geography","relevance"]].copy()
+    table_for_edit.insert(0, "select", False)
+    edited = st.data_editor(
+        table_for_edit,
+        hide_index=True,
+        use_container_width=True,
+        key="edit_table",
+    )
+    selected_links = edited[edited["select"]]["link"].tolist()
+
+    c1, c2, _ = st.columns([1,1,4])
+    with c1:
+        if st.button("Mark as Relevant ✅", disabled=len(selected_links)==0, use_container_width=True):
+            n = batch_update_relevance(selected_links, "relevant")
+            st.success(f"Updated {n} row(s) to relevant.")
+            st.experimental_rerun()
+    with c2:
+        if st.button("Mark as Not Relevant 🚫", disabled=len(selected_links)==0, use_container_width=True):
+            n = batch_update_relevance(selected_links, "not_relevant")
+            st.success(f"Updated {n} row(s) to not_relevant.")
+            st.experimental_rerun()
