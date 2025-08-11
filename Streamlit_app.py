@@ -138,7 +138,7 @@ KEYWORDS = [
 DAYS_LIMIT = 10
 MAX_ARTICLES_PER_RUN = 200_000_000                 # keep reasonable for Sheets quotas
 APPEND_SLEEP_SEC = 0.3                     # small pause between writes
-GOOGLE_SHEET_NAME = "Agentis News Feed"
+GOOGLE_SHEET_NAME = "Agentis News Feed 2"
 
 SHEET_HEADERS = [
     "title","summary","link","published","category",
@@ -608,3 +608,4 @@ else:
             n = batch_update_geo_override(selected_links, "Canada")
             st.success(f"Set geo_override=Canada for {n} row(s).")
             st.experimental_rerun()
+
